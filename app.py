@@ -1,678 +1,863 @@
-# app.py
-# TFP Dynamic Restock – Streamlit app
-# - Minimal settings (lead time, target coverage, safety buffer, rounding/moq, optional year_tag)
-# - Excel export with tabs: FULL, ADMIN, SUPPLIER, PO READY, SETTINGS
-# - PO READY: Our Code = Color SKU = Variant SKU without last 3 digits (master 5 + color 3)
-# - Notes column after Color, Total Units before Photo
-# - Excel print settings for PO READY: fit all columns to page width + repeat header row on each page
+# -*- coding: utf-8 -*-
+"""
+Streamlit App: TFP Restock Engine (Excel 2021-safe)
+
+Run locally:
+  pip install -r requirements.txt
+  streamlit run app.py
+
+What you get:
+- Downloadable Excel model with tabs:
+  FULL, SETTINGS (EN+GR), ADMIN, SUPPLIER, PO READY, INSTRUCTIONS
+- Excel 2021 safe formulas (no dynamic arrays / LET / FILTER / XLOOKUP)
+
+vNext changes (requested in this chat):
+- PO READY: Internal code = Color SKU = Variant SKU without last 3 digits (first 8 digits)
+  SKU structure: 5 master + 3 color + 3 size
+- PO READY: add NOTES after color
+- PO READY: add TOTAL UNITS column before PHOTO
+- PO READY: print setup (fit all columns to 1 page wide + repeat header row)
+- ADMIN: add Color SKU column (so PO READY SUMIFS can match without array tricks)
+"""
 
 from __future__ import annotations
 
-import io
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import xlsxwriter
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# ----------------------------
+# Helpers
+# ----------------------------
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
+_NON_DIGITS = re.compile(r"\D")
 
 
-def _safe_int(x, default: int = 0) -> int:
+def sku11(value) -> Optional[str]:
+    """Extract 11-digit numeric SKU."""
+    if value is None:
+        return None
     try:
-        if pd.isna(x):
+        if isinstance(value, (float, np.floating)) and np.isnan(value):
+            return None
+    except Exception:
+        pass
+    try:
+        if isinstance(value, (float, np.floating)):
+            value = int(value)
+    except Exception:
+        pass
+    s = _NON_DIGITS.sub("", str(value))
+    return s if len(s) == 11 else None
+
+
+def to_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
             return default
-        return int(float(x))
+        if isinstance(x, (float, np.floating)) and np.isnan(x):
+            return default
+        s = str(x).strip()
+        if s == "":
+            return default
+        return float(s)
     except Exception:
         return default
 
 
-def _safe_float(x, default: float = 0.0) -> float:
+def clean_color_attr(x) -> str:
+    if x is None:
+        return ""
     try:
-        if pd.isna(x):
-            return default
-        return float(x)
+        if isinstance(x, (float, np.floating)) and np.isnan(x):
+            return ""
     except Exception:
-        return default
+        pass
+    s = str(x).strip()
+    s = re.sub(r"^\s*Χρώμα\s*:\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*Color\s*:\s*", "", s, flags=re.IGNORECASE)
+    return s.strip()
 
 
-def excel_col(n: int) -> str:
-    """0-indexed to Excel letters."""
-    n += 1
-    out = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        out = chr(65 + r) + out
-    return out
-
-
-def round_up_to_step(x: float, step: int) -> int:
-    if step <= 1:
-        return int(np.ceil(max(0, x)))
-    return int(np.ceil(max(0, x) / step) * step)
-
-
-def parse_variant_sku_parts(variant_sku: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def clean_product_name(raw: object) -> str:
     """
-    Variant SKU format:
-    - first 5: master code
-    - next 3: color code
-    - last 3: size code
-    Example: 21989 001 042  (master=21989, color=001, size=042)
-    Returns (master, color, size) where any can be None if parsing fails.
+    Best-effort product-name cleanup (remove SKU blocks and obvious size suffixes).
     """
-    if variant_sku is None:
-        return None, None, None
-    s = re.sub(r"\s+", "", str(variant_sku))
-    if len(s) < 11:
-        return None, None, None
-    master = s[:5]
-    color = s[5:8]
-    size = s[-3:]
-    return master, color, size
+    if raw is None:
+        return ""
+    try:
+        if isinstance(raw, (float, np.floating)) and np.isnan(raw):
+            return ""
+    except Exception:
+        pass
+
+    s = str(raw).strip()
+
+    # remove [SKU]
+    s = re.sub(r"\[\s*\d{6,}\s*\]", "", s).strip()
+
+    # common separators before attrs
+    s = re.sub(r"\s*\|\s*", " ", s).strip()
+
+    # remove size fragments (EN/GR)
+    s = re.sub(r"(,?\s*(Size|Μέγεθος)\s*:\s*[^,]+)$", "", s, flags=re.IGNORECASE).strip()
+
+    # remove trailing dash size (e.g. "Name - 38")
+    s = re.sub(r"\s*-\s*\d{2,3}\s*$", "", s).strip()
+
+    # collapse spaces
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
 
 
-def derive_our_code(variant_sku: str) -> Optional[str]:
-    """
-    Our Code (Color SKU) = variant SKU without last 3 digits.
-    i.e. master(5) + color(3) = first 8 characters.
-    """
-    if variant_sku is None:
+def parse_days_window_from_filename(filename: str) -> Optional[int]:
+    """Detect day window if filename contains "YYYY-MM-DD - YYYY-MM-DD" (inclusive)."""
+    m = re.search(r"(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})", filename or "")
+    if not m:
         return None
-    s = re.sub(r"\s+", "", str(variant_sku))
-    if len(s) < 8:
+    try:
+        d1 = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        d2 = datetime.strptime(m.group(2), "%Y-%m-%d").date()
+        return (d2 - d1).days + 1
+    except Exception:
         return None
-    return s[:-3] if len(s) >= 11 else s[:8]
 
 
-# -----------------------------
-# Settings
-# -----------------------------
+def extract_odoo_delivered_qty(pivot_bytes: bytes) -> pd.DataFrame:
+    """
+    From Odoo Pivot export (sale.report), extract delivered qty per SKU.
+    Assumes:
+    - Column A has text containing "[SKU]"
+    - Column B has delivered qty
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(BytesIO(pivot_bytes), data_only=True)
+    ws = wb.active
+
+    rows = []
+    for r in range(1, ws.max_row + 1):
+        name = ws.cell(r, 1).value
+        qty = ws.cell(r, 2).value
+        if not name or not isinstance(name, str):
+            continue
+        m = re.search(r"\[(\d+)\]", name)
+        if not m:
+            continue
+        s = m.group(1)
+        if len(s) != 11:
+            continue
+        rows.append((s, to_float(qty, 0.0)))
+
+    if not rows:
+        return pd.DataFrame(columns=["Variant SKU", "Odoo Qty Delivered"])
+
+    df = pd.DataFrame(rows, columns=["Variant SKU", "Odoo Qty Delivered"])
+    return df.groupby("Variant SKU", as_index=False)["Odoo Qty Delivered"].sum()
+
+
+def require_columns(df: pd.DataFrame, required: List[str], label: str) -> None:
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{label} is missing required columns: {missing}")
+
+
+def pick_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Return first existing column name from candidates."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def parse_size_sort_key(x: str):
+    """Sort sizes: numeric first, then alpha."""
+    s = str(x).strip()
+    try:
+        return (0, float(s))
+    except Exception:
+        return (1, s)
+
+
+# ----------------------------
+# SETTINGS (Excel sheet)
+# ----------------------------
 
 @dataclass(frozen=True)
-class Settings:
-    year_tag: str
-    lead_time_weeks: float
-    target_weeks: float
-    safety_buffer: float
-    rounding_step: int
-    moq: int
-    sales_window_weeks: float
+class SettingRow:
+    key: str
+    value: object
+    desc_en: str
+    desc_gr: str
 
 
-# -----------------------------
-# Input loading & normalization
-# -----------------------------
+def build_settings(days_window: int, overrides: Dict[str, object]) -> List[SettingRow]:
+    def v(key, default):
+        return overrides.get(key, default)
 
-COLUMN_SYNONYMS = {
-    "supplier_code": [
-        "supplier code", "vendor code", "supplier", "vendor",
-        "κωδικος προμηθευτη", "κωδικός προμηθευτή", "προμηθευτης",
-    ],
-    "variant_sku": [
-        "variant sku", "sku", "internal code", "εσωτερικος κωδικος", "εσωτερικός κωδικός", "internal sku",
-    ],
-    "color_name": ["color", "χρωμα", "χρώμα"],
-    "product_type": ["product type", "type", "category", "product category"],
-    "product_name": ["name", "product name", "title", "product title"],
-    "photo": ["photo", "image", "image url", "photo url", "φωτο", "εικόνα", "εικονα"],
-    "forecasted": ["forecasted", "forecasted (odoo)", "qty forecasted", "stock forecasted"],
-    "incoming": ["incoming", "in transit", "qty incoming"],
-    "qty_delivered": ["qty delivered", "delivered", "odoo qty delivered"],
-    "on_hand": ["on hand", "qty on hand", "stock on hand", "available"],
-    "outgoing": ["outgoing", "reserved", "allocated", "qty outgoing"],
-    "units_sold": ["units sold", "sold", "qty sold", "sales units", "units"],
-    "season": ["season", "year", "tag", "season tag", "collection"],
-    "size": ["size", "νούμερο", "νουμερο", "νούμερα"],
-}
-
-
-def canonicalize_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Returns df with same columns, plus a mapping from canonical key -> actual column name (if found).
-    """
-    col_map: Dict[str, str] = {}
-    norm_cols = {c: _norm(c) for c in df.columns}
-
-    for key, syns in COLUMN_SYNONYMS.items():
-        for c, nc in norm_cols.items():
-            if nc == _norm(key) or any(nc == _norm(s) for s in syns):
-                col_map[key] = c
-                break
-
-    return df, col_map
-
-
-def read_table(file) -> pd.DataFrame:
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(file, sheet_name=0)
-    raise ValueError("Unsupported file format. Please upload CSV or XLSX.")
-
-
-def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].astype(str).str.strip()
-    return df
-
-
-# -----------------------------
-# Core calculations
-# -----------------------------
-
-def compute_engine(df: pd.DataFrame, col_map: Dict[str, str], s: Settings) -> pd.DataFrame:
-    df = df.copy()
-
-    if "variant_sku" not in col_map:
-        raise ValueError("Could not detect Variant SKU column (e.g., 'Variant SKU' / 'SKU' / 'ΕΣΩΤΕΡΙΚΟΣ ΚΩΔΙΚΟΣ').")
-
-    if s.year_tag.strip():
-        season_col = col_map.get("season")
-        if season_col and season_col in df.columns:
-            df = df[df[season_col].astype(str).str.contains(s.year_tag.strip(), na=False)]
-
-    variant_col = col_map["variant_sku"]
-
-    parts = df[variant_col].apply(parse_variant_sku_parts)
-    df["Master Code"] = parts.apply(lambda t: t[0])
-    df["Color Code"] = parts.apply(lambda t: t[1])
-    df["Size Code"] = parts.apply(lambda t: t[2])
-    df["Our Code"] = df[variant_col].apply(derive_our_code)
-
-    size_col = col_map.get("size")
-    if size_col and size_col in df.columns:
-        df["Size"] = df[size_col].apply(lambda x: _safe_int(x, default=np.nan) if str(x).strip().isdigit() else str(x).strip())
-    else:
-        df["Size"] = df["Size Code"].apply(lambda x: _safe_int(x, default=np.nan))
-
-    forecasted_col = col_map.get("forecasted")
-    incoming_col = col_map.get("incoming")
-    on_hand_col = col_map.get("on_hand")
-    outgoing_col = col_map.get("outgoing")
-    qty_delivered_col = col_map.get("qty_delivered")
-    units_sold_col = col_map.get("units_sold")
-
-    def col_or_zero(cname: Optional[str]) -> pd.Series:
-        if cname and cname in df.columns:
-            return df[cname].apply(_safe_float)
-        return pd.Series([0.0] * len(df), index=df.index)
-
-    df["Forecasted (Odoo)"] = col_or_zero(forecasted_col)
-    df["Incoming"] = col_or_zero(incoming_col)
-    df["On Hand"] = col_or_zero(on_hand_col)
-    df["Outgoing/Reserved"] = col_or_zero(outgoing_col)
-    df["Odoo Qty Delivered"] = col_or_zero(qty_delivered_col)
-
-    computed_forecasted = df["On Hand"] - df["Outgoing/Reserved"] + df["Incoming"]
-    df["Effective Forecasted"] = np.where(df["Forecasted (Odoo)"] != 0, df["Forecasted (Odoo)"], computed_forecasted)
-
-    sold_base = col_or_zero(units_sold_col)
-    sold_base = np.where(sold_base != 0, sold_base, df["Odoo Qty Delivered"])
-    df["_sold_base"] = sold_base
-
-    window_weeks = max(1e-6, float(s.sales_window_weeks))
-    df["Units/week adj"] = df["_sold_base"] / window_weeks
-
-    safety = max(0.0, float(s.safety_buffer))
-    df["Demand units (target)"] = df["Units/week adj"] * float(s.target_weeks) * (1.0 + safety)
-    df["Gap"] = df["Demand units (target)"] - df["Effective Forecasted"]
-    df["Reorder point"] = df["Units/week adj"] * float(s.lead_time_weeks) * (1.0 + safety)
-
-    def suggest(row) -> int:
-        gap = float(row["Gap"])
-        if gap <= 0:
-            return 0
-        eff = float(row["Effective Forecasted"])
-        rp = float(row["Reorder point"])
-        if eff > rp and row["Units/week adj"] < 0.25:
-            return 0
-        qty = round_up_to_step(gap, int(s.rounding_step))
-        if qty <= 0:
-            return 0
-        return max(int(s.moq), qty)
-
-    df["Engine Suggested"] = df.apply(suggest, axis=1).astype(int)
-    df.drop(columns=["_sold_base"], inplace=True)
-
-    return df
+    rows: List[SettingRow] = [
+        SettingRow(
+            "sales_source", v("sales_source", "SHOPIFY"),
+            "Sales source for demand: SHOPIFY, ODOO, or MAX (use the higher).",
+            "Πηγή πωλήσεων για τη ζήτηση: SHOPIFY, ODOO ή MAX (κρατάει το μεγαλύτερο)."
+        ),
+        SettingRow(
+            "season_mode", v("season_mode", "FW"),
+            "Season context: FW, SS, or NEUTRAL (no season scaling).",
+            "Σεζόν αναφοράς: FW, SS ή NEUTRAL (χωρίς season scaling)."
+        ),
+        SettingRow(
+            "year_tag", v("year_tag", "2025-2026"),
+            "Season year label used for EXACT match detection. If you put '2025', it matches any season text containing 2025.",
+            "Ετικέτα χρονιάς για EXACT match. Αν βάλεις '2025' θα πιάσει ό,τι περιέχει 2025 μέσα στο κείμενο της σεζόν."
+        ),
+        SettingRow(
+            "target_weeks", int(v("target_weeks", 10)),
+            "Target stock coverage in weeks.",
+            "Στόχος κάλυψης σε εβδομάδες."
+        ),
+        SettingRow(
+            "lead_time_weeks", int(v("lead_time_weeks", 3)),
+            "Supplier lead time (weeks). Used for reorder point.",
+            "Lead time προμηθευτή (εβδομάδες). Χρησιμοποιείται στο reorder point."
+        ),
+        SettingRow(
+            "safety_buffer", float(v("safety_buffer", 0.10)),
+            "Safety buffer on top of demand (0.10 = +10%).",
+            "Safety buffer πάνω στη ζήτηση (0.10 = +10%)."
+        ),
+        SettingRow(
+            "rounding_step", int(v("rounding_step", 6)),
+            "Round up suggested units to this step (e.g., 6 pairs).",
+            "Στρογγυλοποίηση προς τα πάνω (π.χ. 6 → 6/12/18)."
+        ),
+        SettingRow(
+            "moq", int(v("moq", 6)),
+            "Minimum order quantity per SKU (applies only when restocking).",
+            "MOQ ανά SKU (ισχύει μόνο όταν προτείνουμε restock)."
+        ),
+        # Advanced (kept in Excel, optional in UI)
+        SettingRow("mult_exact", float(v("mult_exact", 1.20)),
+                   "Advanced: Demand multiplier for EXACT season+year matches.",
+                   "Advanced: Multiplier για EXACT season+year."),
+        SettingRow("mult_partial", float(v("mult_partial", 1.00)),
+                   "Advanced: Multiplier for same season family but not the main year.",
+                   "Advanced: Multiplier για ίδια σεζόν, άλλη χρονιά."),
+        SettingRow("mult_offseason", float(v("mult_offseason", 0.65)),
+                   "Advanced: Multiplier for off-season.",
+                   "Advanced: Multiplier εκτός σεζόν."),
+        SettingRow("mult_unknown", float(v("mult_unknown", 0.90)),
+                   "Advanced: Multiplier for unknown season.",
+                   "Advanced: Multiplier για άγνωστη σεζόν."),
+        SettingRow("days_window", int(days_window),
+                   "Days in the sales window (auto). Used to convert sales to weekly demand.",
+                   "Ημέρες δεδομένων (auto). Για μετατροπή σε πωλήσεις/εβδομάδα."),
+        SettingRow("allow_override_outlet", int(v("allow_override_outlet", 0)),
+                   "Advanced: If 0, OUTLET SKUs are forced to 0 even with override.",
+                   "Advanced: Αν 0, τα OUTLET είναι πάντα 0, ακόμα κι αν βάλεις override."),
+    ]
+    return rows
 
 
-# -----------------------------
-# Excel Export
-# -----------------------------
+# ----------------------------
+# Core build (FULL)
+# ----------------------------
 
-def build_excel(df: pd.DataFrame, col_map: Dict[str, str], s: Settings) -> bytes:
-    output = io.BytesIO()
-    full_df = df.copy()
+def build_full_df(
+    odoo_bytes: bytes,
+    shopify_bytes: bytes,
+    shopify_filename: str,
+    pivot_bytes: bytes,
+) -> Tuple[pd.DataFrame, int, Dict[str, int]]:
 
-    supplier_col = col_map.get("supplier_code")
-    product_type_col = col_map.get("product_type")
-    product_name_col = col_map.get("product_name")
-    color_col = col_map.get("color_name")
-    photo_col = col_map.get("photo")
-    variant_col = col_map["variant_sku"]
+    odoo_df = pd.read_excel(BytesIO(odoo_bytes), dtype=str)
+    shop_df = pd.read_csv(BytesIO(shopify_bytes), dtype=str)
 
-    admin_cols = []
-    if supplier_col and supplier_col in full_df.columns:
-        admin_cols.append(supplier_col)
+    require_columns(odoo_df, ["Internal Reference"], "Odoo Product Variant export")
+    require_columns(shop_df, ["Product variant SKU"], "Shopify sales export")
 
-    admin_cols += ["Our Code", "Master Code", "Color Code"]
+    pivot_df = extract_odoo_delivered_qty(pivot_bytes)
+    days_window = parse_days_window_from_filename(shopify_filename) or 30
 
-    if product_type_col and product_type_col in full_df.columns:
-        admin_cols.append(product_type_col)
-    if product_name_col and product_name_col in full_df.columns:
-        admin_cols.append(product_name_col)
-    if color_col and color_col in full_df.columns:
-        admin_cols.append(color_col)
+    base = odoo_df.copy()
+    base["Variant SKU"] = base["Internal Reference"].apply(sku11)
+    base = base[base["Variant SKU"].notna()].copy()
+    if base.empty:
+        raise ValueError("No valid 11-digit SKUs found in Odoo Product Variant file (Internal Reference).")
 
-    admin_cols += [
-        variant_col,
-        "Size",
-        "Odoo Qty Delivered",
-        "Forecasted (Odoo)",
-        "Effective Forecasted",
-        "Units/week adj",
-        "Demand units (target)",
-        "Gap",
-        "Reorder point",
-        "Engine Suggested",
-        "Override Qty",
-        "Final Qty",
+    # best-effort: product type + name + photo
+    col_type = pick_first_col(base, [
+        "Product Type", "Product type", "Type",
+        "Product Category", "Product Category/Complete Name", "Product Category/Name"
+    ])
+    col_name = pick_first_col(base, ["Name", "Display Name", "Product Name", "Product Template", "Product Template/Name"])
+    col_photo = pick_first_col(base, [
+        "Image Url", "Image URL", "Image", "Photo", "PHOTO",
+        "Image 128", "Image 1920", "Website Image", "Website Image/Url"
+    ])
+
+    product_type = base[col_type].astype(str).fillna("") if col_type else ""
+    product_name_raw = base[col_name].astype(str).fillna("") if col_name else ""
+    product_name = product_name_raw.apply(clean_product_name) if col_name else ""
+
+    full = pd.DataFrame({
+        "Product Type": product_type,
+        "Product Name": product_name,
+        "Variant SKU": base["Variant SKU"].astype(str),
+        "Group Key": base.get("Color SKU", "").astype(str).fillna(""),
+        "Our Code": base.get("Master Code", "").astype(str).fillna(""),
+        "Color": base.get("Color Attribute", "").apply(clean_color_attr),
+        "Size": base.get("Size Value", "").astype(str).fillna(""),
+        "Vendor": base.get("Vendors/Display Name", "").astype(str).fillna(""),
+        "Vendor Code": base.get("Vendors/Vendor Product Code", "").astype(str).fillna(""),
+        "Product Season": base.get("Product Season", "").astype(str).fillna(""),
+        "On Hand": base.get("Quantity On Hand", 0).apply(to_float),
+        "Reserved / Outgoing": base.get("Outgoing Quantity", 0).apply(to_float) if "Outgoing Quantity" in base.columns else 0.0,
+        "Incoming": base.get("Incoming Quantity", 0).apply(to_float) if "Incoming Quantity" in base.columns else 0.0,
+        "Forecasted (Odoo)": base.get("Forecasted Quantity", "").apply(to_float, default=np.nan),
+        "Photo": base[col_photo].astype(str).fillna("") if col_photo else "",
+    })
+
+    # Derived codes from Variant SKU (11 digits): 5 master + 3 color + 3 size
+    # Color SKU (internal code) = Variant SKU without last 3 digits (first 8 digits)
+    full["Color SKU"] = full["Variant SKU"].apply(lambda x: (str(x)[:-3] if isinstance(x, str) and len(x) == 11 else ""))
+
+    # Shopify aggregate
+    s = shop_df.copy()
+    s["Variant SKU"] = s["Product variant SKU"].apply(sku11)
+    s = s[s["Variant SKU"].notna()].copy()
+
+    for c in ["Net sales", "Net items sold", "Cost of goods sold", "Gross profit", "Quantity ordered", "Quantity returned"]:
+        if c in s.columns:
+            s[c] = s[c].apply(to_float)
+        else:
+            s[c] = 0.0
+
+    agg = s.groupby("Variant SKU", as_index=False)[
+        ["Net sales", "Net items sold", "Cost of goods sold", "Gross profit", "Quantity ordered", "Quantity returned"]
+    ].sum()
+
+    agg["Gross margin"] = np.where(agg["Net sales"] > 0, agg["Gross profit"] / agg["Net sales"], 0.0)
+    agg["Return rate"] = np.where(agg["Quantity ordered"] > 0, agg["Quantity returned"] / agg["Quantity ordered"], 0.0)
+    agg.rename(columns={"Net items sold": "Shop Net items sold", "Cost of goods sold": "COGS"}, inplace=True)
+
+    full = full.merge(
+        agg[["Variant SKU", "Shop Net items sold", "Net sales", "COGS", "Gross profit", "Gross margin", "Return rate"]],
+        on="Variant SKU",
+        how="left",
+    )
+
+    for c in ["Shop Net items sold", "Net sales", "COGS", "Gross profit", "Gross margin", "Return rate"]:
+        full[c] = full[c].fillna(0.0)
+
+    full = full.merge(pivot_df, on="Variant SKU", how="left")
+    full["Odoo Qty Delivered"] = full["Odoo Qty Delivered"].fillna(0.0)
+
+    stats = {
+        "warehouse_skus": int(full["Variant SKU"].nunique()),
+        "shopify_skus_with_sales": int(full.loc[full["Shop Net items sold"] > 0, "Variant SKU"].nunique()),
+        "odoo_skus_with_delivered": int(full.loc[full["Odoo Qty Delivered"] > 0, "Variant SKU"].nunique()),
+        "skus_with_zero_sales": int(full.loc[(full["Shop Net items sold"] <= 0) & (full["Odoo Qty Delivered"] <= 0), "Variant SKU"].nunique()),
+    }
+
+    return full, days_window, stats
+
+
+# ----------------------------
+# Excel writer
+# ----------------------------
+
+def build_excel_bytes(full: pd.DataFrame, days_window: int, settings_overrides: Dict[str, object]) -> bytes:
+    settings = build_settings(days_window, settings_overrides)
+    n = len(full)
+    full_cols = list(full.columns)
+
+    sizes = sorted([s for s in full["Size"].astype(str).fillna("").unique().tolist() if str(s).strip() != ""], key=parse_size_sort_key)
+
+    output = BytesIO()
+    wb = xlsxwriter.Workbook(output, {"in_memory": True, "nan_inf_to_errors": True})
+
+    ws_full = wb.add_worksheet("FULL")
+    ws_set = wb.add_worksheet("SETTINGS")
+    ws_admin = wb.add_worksheet("ADMIN")
+    ws_sup = wb.add_worksheet("SUPPLIER")
+    ws_po = wb.add_worksheet("PO READY")
+    ws_help = wb.add_worksheet("INSTRUCTIONS")
+
+    fmt_header = wb.add_format({"bold": True, "bg_color": "#F2F2F2", "border": 1})
+    fmt_note = wb.add_format({"text_wrap": True})
+
+    fmt_engine_header = wb.add_format({"bold": True, "bg_color": "#FFF2CC", "border": 1})
+    fmt_engine_cell = wb.add_format({"bg_color": "#FFF2CC", "border": 1})
+
+    # SETTINGS
+    ws_set.write(0, 0, "key", fmt_header)
+    ws_set.write(0, 1, "value", fmt_header)
+    ws_set.write(0, 2, "description (EN)", fmt_header)
+    ws_set.write(0, 3, "επεξήγηση (GR) + παράδειγμα", fmt_header)
+
+    key_row: Dict[str, int] = {}
+    for i, row in enumerate(settings, start=1):
+        ws_set.write(i, 0, row.key)
+        if isinstance(row.value, (int, float)):
+            ws_set.write_number(i, 1, float(row.value))
+        else:
+            ws_set.write_string(i, 1, str(row.value))
+        ws_set.write(i, 2, row.desc_en)
+        ws_set.write(i, 3, row.desc_gr)
+        key_row[row.key] = i + 1
+
+    ws_set.set_column(0, 0, 26)
+    ws_set.set_column(1, 1, 18)
+    ws_set.set_column(2, 2, 70)
+    ws_set.set_column(3, 3, 85)
+    ws_set.freeze_panes(1, 0)
+
+    ws_set.add_table(
+        0, 0, len(settings), 3,
+        {
+            "name": "tbl_settings",
+            "style": "Table Style Light 9",
+            "autofilter": True,
+            "columns": [
+                {"header": "key"},
+                {"header": "value"},
+                {"header": "description (EN)"},
+                {"header": "επεξήγηση (GR) + παράδειγμα"},
+            ],
+        },
+    )
+
+    def S(key: str) -> str:
+        return f"SETTINGS!$B${key_row[key]}"
+
+    # FULL values
+    for j, c in enumerate(full_cols):
+        ws_full.write(0, j, c, fmt_header)
+
+    for i in range(n):
+        for j, c in enumerate(full_cols):
+            val = full.iloc[i, j]
+            if isinstance(val, (int, float, np.integer, np.floating)) and not pd.isna(val):
+                ws_full.write_number(i + 1, j, float(val))
+            else:
+                if pd.isna(val):
+                    ws_full.write_blank(i + 1, j, None)
+                else:
+                    ws_full.write_string(i + 1, j, str(val))
+
+    ws_full.freeze_panes(1, 0)
+    ws_full.set_column(0, 6, 18)
+    ws_full.set_column(7, len(full_cols) - 1, 16)
+
+    ws_full.add_table(
+        0, 0, n, len(full_cols) - 1,
+        {
+            "name": "tbl_full",
+            "style": "Table Style Light 9",
+            "autofilter": True,
+            "columns": [{"header": c} for c in full_cols],
+        },
+    )
+
+    # ADMIN
+    admin_headers = [
+        "Product Type", "Product Name",
+        "Variant SKU", "Our Code", "Color", "Size",
+        "Vendor", "Vendor Code", "Product Season",
+        "On Hand", "Reserved / Outgoing", "Incoming",
+        "Forecasted (Odoo)", "Effective Forecasted",
+        "Engine Suggested", "Override Qty", "Final Qty",
+        "Shop Net items sold", "Odoo Qty Delivered", "Net items sold (used)",
+        "Units/week adj", "Demand units (target)", "Gap", "Reorder point",
+        "Season Class", "Season Mult",
+        "Return rate", "Gross margin", "Gross profit", "Net sales", "COGS",
+        "Color SKU",
+        "Reason",
     ]
 
-    if photo_col and photo_col in full_df.columns:
-        admin_cols.append(photo_col)
+    for j, h in enumerate(admin_headers):
+        if h in ("Engine Suggested", "Override Qty", "Final Qty"):
+            ws_admin.write(0, j, h, fmt_engine_header)
+        else:
+            ws_admin.write(0, j, h, fmt_header)
 
-    admin = full_df.copy()
-    if "Override Qty" not in admin.columns:
-        admin["Override Qty"] = np.nan
-    if "Final Qty" not in admin.columns:
-        admin["Final Qty"] = np.nan
+    full_col_index = {c: i for i, c in enumerate(full_cols)}
 
-    admin = admin[[c for c in admin_cols if c in admin.columns]]
+    def xlcol(idx: int) -> str:
+        return xlsxwriter.utility.xl_col_to_name(idx)
 
-    group_cols = []
-    if supplier_col and supplier_col in admin.columns:
-        group_cols.append(supplier_col)
-    group_cols.append("Our Code")
-    if color_col and color_col in admin.columns:
-        group_cols.append(color_col)
-    if product_name_col and product_name_col in admin.columns:
-        group_cols.append(product_name_col)
+    def F(colname: str, excel_row: int) -> str:
+        return f"FULL!${xlcol(full_col_index[colname])}${excel_row}"
 
-    group_df = admin[group_cols].drop_duplicates()
+    # Column mapping (ADMIN) — important for PO READY SUMIFS
+    # A Product Type
+    # B Product Name
+    # C Variant SKU
+    # D Our Code (master code)
+    # E Color
+    # F Size
+    # G Vendor
+    # H Vendor Code
+    # ...
+    # Q Final Qty
+    # AF Color SKU (internal code, 8 digits)
+    # AG Reason
 
-    supplier_rows = group_df.copy()
-    if supplier_col and supplier_col in supplier_rows.columns:
-        supplier_rows.rename(columns={supplier_col: "Supplier Code"}, inplace=True)
-    if color_col and color_col in supplier_rows.columns:
-        supplier_rows.rename(columns={color_col: "Color"}, inplace=True)
-    if product_name_col and product_name_col in supplier_rows.columns:
-        supplier_rows.rename(columns={product_name_col: "Name"}, inplace=True)
+    for i in range(n):
+        r = i + 2  # excel row
 
-    po_rows = group_df.copy()
-    if supplier_col and supplier_col in po_rows.columns:
-        po_rows.rename(columns={supplier_col: "Supplier Code"}, inplace=True)
-    if color_col and color_col in po_rows.columns:
-        po_rows.rename(columns={color_col: "Color"}, inplace=True)
-    if product_name_col and product_name_col in po_rows.columns:
-        po_rows.drop(columns=[product_name_col], inplace=True)
+        ws_admin.write_formula(i + 1, 0, f"={F('Product Type', r)}")
+        ws_admin.write_formula(i + 1, 1, f"={F('Product Name', r)}")
+        ws_admin.write_formula(i + 1, 2, f"={F('Variant SKU', r)}")
+        ws_admin.write_formula(i + 1, 3, f"={F('Our Code', r)}")
+        ws_admin.write_formula(i + 1, 4, f"={F('Color', r)}")
+        ws_admin.write_formula(i + 1, 5, f"={F('Size', r)}")
+        ws_admin.write_formula(i + 1, 6, f"={F('Vendor', r)}")
+        ws_admin.write_formula(i + 1, 7, f"={F('Vendor Code', r)}")
+        ws_admin.write_formula(i + 1, 8, f"={F('Product Season', r)}")
 
-    po_rows["Notes"] = ""
+        ws_admin.write_formula(i + 1, 9, f"={F('On Hand', r)}")
+        ws_admin.write_formula(i + 1, 10, f"={F('Reserved / Outgoing', r)}")
+        ws_admin.write_formula(i + 1, 11, f"={F('Incoming', r)}")
+        ws_admin.write_formula(i + 1, 12, f"={F('Forecasted (Odoo)', r)}")
 
-    sizes = sorted([x for x in admin["Size"].dropna().unique()], key=lambda z: int(z) if str(z).isdigit() else str(z))
-    size_headers = []
-    for z in sizes:
-        zs = str(z).strip()
-        if zs.isdigit():
-            size_headers.append(int(zs))
-    size_headers = sorted(set(size_headers))
-
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        workbook = writer.book
-
-        fmt_header = workbook.add_format({"bold": True, "bg_color": "#E6E6E6", "border": 1, "align": "center", "valign": "vcenter"})
-        fmt_header_dark = workbook.add_format({"bold": True, "bg_color": "#111111", "font_color": "#FFFFFF", "border": 1, "align": "center", "valign": "vcenter"})
-        fmt_cell = workbook.add_format({"border": 1})
-        fmt_int = workbook.add_format({"border": 1, "num_format": "0"})
-        fmt_float = workbook.add_format({"border": 1, "num_format": "0.00"})
-        fmt_link = workbook.add_format({"border": 1, "font_color": "blue", "underline": 1})
-        fmt_highlight = workbook.add_format({"border": 1, "bg_color": "#FFF2CC"})
-        fmt_final = workbook.add_format({"border": 1, "bg_color": "#D9E1F2"})
-        fmt_notes = workbook.add_format({"border": 1, "bg_color": "#F8F8F8"})
-
-        settings_df = pd.DataFrame(
-            [
-                ["year_tag", s.year_tag],
-                ["lead_time_weeks", s.lead_time_weeks],
-                ["target_weeks", s.target_weeks],
-                ["safety_buffer", s.safety_buffer],
-                ["rounding_step", s.rounding_step],
-                ["moq", s.moq],
-                ["sales_window_weeks", s.sales_window_weeks],
-            ],
-            columns=["Setting", "Value"],
+        season_cell = f"$I{r}"
+        fw = f'OR(ISNUMBER(SEARCH("Φθινόπωρο",{season_cell})),ISNUMBER(SEARCH("Χειμώνας",{season_cell})),ISNUMBER(SEARCH("FW",{season_cell})),ISNUMBER(SEARCH("Fall",{season_cell})),ISNUMBER(SEARCH("Winter",{season_cell})))'
+        ss = f'OR(ISNUMBER(SEARCH("Άνοιξη",{season_cell})),ISNUMBER(SEARCH("Καλοκαίρι",{season_cell})),ISNUMBER(SEARCH("SS",{season_cell})),ISNUMBER(SEARCH("Spring",{season_cell})),ISNUMBER(SEARCH("Summer",{season_cell})))'
+        hy = f'IF({S("year_tag")}="",FALSE,ISNUMBER(SEARCH({S("year_tag")},{season_cell})))'
+        season_class = (
+            f'IF({S("season_mode")}="NEUTRAL","PARTIAL",'
+            f'IF({S("season_mode")}="FW",'
+            f'IF(AND({fw},{hy}),"EXACT",IF({fw},"PARTIAL",IF({ss},"OFFSEASON","UNKNOWN"))),'
+            f'IF({S("season_mode")}="SS",'
+            f'IF(AND({ss},{hy}),"EXACT",IF({ss},"PARTIAL",IF({fw},"OFFSEASON","UNKNOWN"))),'
+            f'"UNKNOWN")))'
         )
-        settings_df.to_excel(writer, sheet_name="SETTINGS", index=False)
-        ws_settings = writer.sheets["SETTINGS"]
-        ws_settings.autofilter(0, 0, len(settings_df), 1)
-        ws_settings.freeze_panes(1, 0)
+        ws_admin.write_formula(i + 1, 24, f"={season_class}")
+        ws_admin.write_formula(
+            i + 1,
+            25,
+            f'=IF($Y{r}="EXACT",{S("mult_exact")},IF($Y{r}="PARTIAL",{S("mult_partial")},IF($Y{r}="OFFSEASON",{S("mult_offseason")},{S("mult_unknown")})))'
+        )
 
-        full_df.to_excel(writer, sheet_name="FULL", index=False)
-        ws_full = writer.sheets["FULL"]
-        ws_full.autofilter(0, 0, len(full_df), len(full_df.columns) - 1)
-        ws_full.freeze_panes(1, 0)
+        ws_admin.write_formula(i + 1, 13, f'=IF($M{r}<>"",$M{r},($J{r}-$K{r}+$L{r}))')
 
-        sheet_admin = "ADMIN"
-        ws_admin = workbook.add_worksheet(sheet_admin)
-        writer.sheets[sheet_admin] = ws_admin
+        ws_admin.write_formula(i + 1, 17, f"={F('Shop Net items sold', r)}")
+        ws_admin.write_formula(i + 1, 18, f"={F('Odoo Qty Delivered', r)}")
 
-        for j, col in enumerate(admin.columns):
-            header_fmt = fmt_header_dark if col in ("Engine Suggested", "Override Qty", "Final Qty") else fmt_header
-            ws_admin.write(0, j, col, header_fmt)
+        ws_admin.write_formula(i + 1, 19, f'=IF({S("sales_source")}="SHOPIFY",$R{r},IF({S("sales_source")}="ODOO",$S{r},MAX($R{r},$S{r})))')
 
-        col_idx = {c: i for i, c in enumerate(admin.columns)}
-        n_rows = len(admin)
+        ws_admin.write_formula(i + 1, 26, f"={F('Return rate', r)}")
+        ws_admin.write_formula(i + 1, 27, f"={F('Gross margin', r)}")
+        ws_admin.write_formula(i + 1, 28, f"={F('Gross profit', r)}")
+        ws_admin.write_formula(i + 1, 29, f"={F('Net sales', r)}")
+        ws_admin.write_formula(i + 1, 30, f"={F('COGS', r)}")
 
-        for i in range(n_rows):
-            excel_r = i + 1
-            for j, col in enumerate(admin.columns):
-                val = admin.iat[i, j]
+        ws_admin.write_formula(i + 1, 20, f'=IF({S("days_window")}>0,($T{r}/{S("days_window")})*7*(1-$AA{r})*$Z{r},0)')
+        ws_admin.write_formula(i + 1, 21, f'=$U{r}*{S("target_weeks")}*(1+{S("safety_buffer")})')
+        ws_admin.write_formula(i + 1, 22, f'=$V{r}-$N{r}')
+        ws_admin.write_formula(i + 1, 23, f'=$U{r}*{S("lead_time_weeks")}*(1+{S("safety_buffer")})')
 
-                if col == "Override Qty":
-                    ws_admin.write_blank(excel_r, j, None, fmt_highlight)
-                    continue
+        eng = f'=IF(ISNUMBER(SEARCH("OUTLET",$I{r})),0,IF($W{r}<=0,0,MAX({S("moq")},CEILING($W{r},{S("rounding_step")}))))'
+        ws_admin.write_formula(i + 1, 14, eng, fmt_engine_cell)
 
-                if col == "Final Qty":
-                    c_override = excel_col(col_idx["Override Qty"])
-                    c_engine = excel_col(col_idx["Engine Suggested"])
-                    # Greek Excel separator ';'
-                    formula = f'=IF(ISNUMBER({c_override}{excel_r+1});{c_override}{excel_r+1};{c_engine}{excel_r+1})'
-                    ws_admin.write_formula(excel_r, j, formula, fmt_final)
-                    continue
+        ws_admin.write_blank(i + 1, 15, None, fmt_engine_cell)
 
-                if col == "Engine Suggested":
-                    ws_admin.write_number(excel_r, j, _safe_int(val, 0), fmt_highlight)
-                elif col in ("Odoo Qty Delivered", "Forecasted (Odoo)", "Effective Forecasted", "Demand units (target)", "Gap", "Reorder point", "Units/week adj"):
-                    ws_admin.write_number(excel_r, j, _safe_float(val, 0.0), fmt_float)
-                elif col == "Size":
-                    ws_admin.write_number(excel_r, j, _safe_int(val, 0), fmt_int)
-                else:
-                    if isinstance(val, str) and val.startswith("http"):
-                        ws_admin.write_url(excel_r, j, val, fmt_link, string=val)
-                    else:
-                        ws_admin.write(excel_r, j, "" if pd.isna(val) else val, fmt_cell)
+        ws_admin.write_formula(
+            i + 1,
+            16,
+            f'=IF(AND(ISNUMBER(SEARCH("OUTLET",$I{r})),{S("allow_override_outlet")}=0),0,IF($P{r}<>"",$P{r},$O{r}))',
+            fmt_engine_cell
+        )
 
-        ws_admin.autofilter(0, 0, n_rows, len(admin.columns) - 1)
-        ws_admin.freeze_panes(1, 0)
+        # Color SKU (AF): Variant SKU without last 3 digits => first 8 digits
+        ws_admin.write_formula(i + 1, 31, f'=IF(LEN($C{r})=11,LEFT($C{r},8),"")')
 
-        def abs_range(colname: str) -> str:
-            j = col_idx[colname]
-            col_letter = excel_col(j)
-            return f"'{sheet_admin}'!${col_letter}$2:${col_letter}${n_rows+1}"
+        # Reason (AG)
+        ws_admin.write_formula(i + 1, 32, f'=IF(ISNUMBER(SEARCH("OUTLET",$I{r})),"OUTLET",IF($W{r}>0,"RESTOCK","NO_ACTION"))')
 
-        rng_supplier = abs_range(supplier_col) if supplier_col and supplier_col in col_idx else None
-        rng_our = abs_range("Our Code")
-        rng_color = abs_range(color_col) if color_col and color_col in col_idx else None
-        rng_size = abs_range("Size")
-        rng_final = abs_range("Final Qty")
+    ws_admin.freeze_panes(1, 4)
+    ws_admin.set_column(0, 0, 18)
+    ws_admin.set_column(1, 1, 34)
+    ws_admin.set_column(2, 8, 16)
+    ws_admin.set_column(9, 13, 14)
+    ws_admin.set_column(14, 16, 14)
+    ws_admin.set_column(17, 32, 16)
 
-        # SUPPLIER
-        sup_sheet = "SUPPLIER"
-        ws_sup = workbook.add_worksheet(sup_sheet)
-        writer.sheets[sup_sheet] = ws_sup
+    ws_admin.add_table(
+        0, 0, n, len(admin_headers) - 1,
+        {
+            "name": "tbl_admin",
+            "style": "Table Style Light 9",
+            "autofilter": True,
+            "columns": [{"header": h} for h in admin_headers],
+        },
+    )
 
-        sup_base_cols = []
-        if "Supplier Code" in supplier_rows.columns:
-            sup_base_cols.append("Supplier Code")
-        sup_base_cols.append("Our Code")
-        if "Name" in supplier_rows.columns:
-            sup_base_cols.append("Name")
-        if "Color" in supplier_rows.columns:
-            sup_base_cols.append("Color")
+    # SUPPLIER (includes product name)
+    sup_headers = [
+        "vendor", "vendor code", "product name", "color", "size",
+        "Qty", "our code", "variant sku", "notes", "image link"
+    ]
+    for j, h in enumerate(sup_headers):
+        ws_sup.write(0, j, h, fmt_header)
 
-        c = 0
-        for col in sup_base_cols:
-            ws_sup.write(0, c, col, fmt_header)
-            c += 1
-        for sz in size_headers:
-            ws_sup.write(0, c, sz, fmt_header)
-            c += 1
-        ws_sup.write(0, c, "PHOTO", fmt_header)
+    for i in range(n):
+        r = i + 2
+        ws_sup.write_formula(i + 1, 0, f"=ADMIN!$G{r}")
+        ws_sup.write_formula(i + 1, 1, f"=ADMIN!$H{r}")
+        ws_sup.write_formula(i + 1, 2, f"=ADMIN!$B{r}")
+        ws_sup.write_formula(i + 1, 3, f"=ADMIN!$E{r}")
+        ws_sup.write_formula(i + 1, 4, f"=ADMIN!$F{r}")
+        ws_sup.write_formula(i + 1, 5, f"=ADMIN!$Q{r}")
+        ws_sup.write_formula(i + 1, 6, f"=ADMIN!$D{r}")
+        ws_sup.write_formula(i + 1, 7, f"=ADMIN!$C{r}")
+        ws_sup.write_blank(i + 1, 8, None)
+        # Photo from FULL (robust)
+        if "Photo" in full_col_index:
+            ws_sup.write_formula(i + 1, 9, f"=FULL!${xlcol(full_col_index['Photo'])}${r}")
+        else:
+            ws_sup.write_blank(i + 1, 9, None)
 
-        sup_col_idx = {sup_base_cols[k]: k for k in range(len(sup_base_cols))}
+    ws_sup.freeze_panes(1, 0)
+    ws_sup.set_column(0, 1, 22)
+    ws_sup.set_column(2, 2, 36)
+    ws_sup.set_column(3, 4, 14)
+    ws_sup.set_column(5, 5, 10)
+    ws_sup.set_column(6, 7, 16)
+    ws_sup.set_column(8, 9, 28)
 
-        for i in range(len(supplier_rows)):
-            excel_r = i + 1
-            c = 0
-            for col in sup_base_cols:
-                v = supplier_rows.iloc[i][col]
-                ws_sup.write(excel_r, c, "" if pd.isna(v) else v, fmt_cell)
-                c += 1
+    ws_sup.add_table(
+        0, 0, n, len(sup_headers) - 1,
+        {
+            "name": "tbl_supplier",
+            "style": "Table Style Light 9",
+            "autofilter": True,
+            "columns": [{"header": h} for h in sup_headers],
+        },
+    )
 
-            supplier_cell = None
-            if "Supplier Code" in sup_col_idx:
-                supplier_cell = f"${excel_col(sup_col_idx['Supplier Code'])}${excel_r+1}"
-            our_cell = f"${excel_col(sup_col_idx['Our Code'])}${excel_r+1}"
-            color_cell = f"${excel_col(sup_col_idx['Color'])}${excel_r+1}" if "Color" in sup_col_idx else None
+    # PO READY (matrix)
+    # Rows unique by (Vendor Code, Color SKU, Color, Photo)
+    po_base = full[["Vendor Code", "Color SKU", "Color", "Photo"]].copy()
+    po_base["Vendor Code"] = po_base["Vendor Code"].astype(str).fillna("")
+    po_base["Color SKU"] = po_base["Color SKU"].astype(str).fillna("")
+    po_base["Color"] = po_base["Color"].astype(str).fillna("")
+    po_base["Photo"] = po_base["Photo"].astype(str).fillna("")
+    po_base = po_base.drop_duplicates().reset_index(drop=True)
 
-            for sz in size_headers:
-                sz_header_cell = f"{excel_col(c)}$1"
-                parts = [f"=SUMIFS({rng_final};{rng_size};{sz_header_cell};{rng_our};{our_cell}"]
-                if supplier_cell and rng_supplier:
-                    parts.append(f";{rng_supplier};{supplier_cell}")
-                if color_cell and rng_color:
-                    parts.append(f";{rng_color};{color_cell}")
-                parts.append(")")
-                ws_sup.write_formula(excel_r, c, "".join(parts), fmt_int)
-                c += 1
+    po_headers = ["ΚΩΔΙΚΟΣ ΠΡΟΜΗΘΕΥΤΗ", "ΕΣΩΤΕΡΙΚΟΣ ΚΩΔΙΚΟΣ", "ΧΡΩΜΑ", "NOTES"] + sizes + ["ΣΥΝΟΛΟ ΤΜΧ", "PHOTO"]
+    for j, h in enumerate(po_headers):
+        ws_po.write(0, j, h, fmt_header)
 
-            photo_val = ""
-            if photo_col and photo_col in full_df.columns:
-                mask = (full_df["Our Code"] == supplier_rows.iloc[i]["Our Code"])
-                if "Supplier Code" in supplier_rows.columns and supplier_col and supplier_col in full_df.columns:
-                    mask = mask & (full_df[supplier_col] == supplier_rows.iloc[i]["Supplier Code"])
-                if "Color" in supplier_rows.columns and color_col and color_col in full_df.columns:
-                    mask = mask & (full_df[color_col] == supplier_rows.iloc[i]["Color"])
-                candidates = full_df.loc[mask, photo_col].dropna()
-                if len(candidates) > 0:
-                    photo_val = str(candidates.iloc[0])
+    for i in range(len(po_base)):
+        rr = i + 2
+        ws_po.write_string(i + 1, 0, str(po_base.loc[i, "Vendor Code"]))
+        ws_po.write_string(i + 1, 1, str(po_base.loc[i, "Color SKU"]))
+        ws_po.write_string(i + 1, 2, str(po_base.loc[i, "Color"]))
+        ws_po.write_blank(i + 1, 3, None)  # NOTES
 
-            if photo_val.startswith("http"):
-                ws_sup.write_url(excel_r, c, photo_val, fmt_link, string=photo_val)
-            else:
-                ws_sup.write(excel_r, c, photo_val, fmt_cell)
+        for j, size in enumerate(sizes):
+            col_idx = 4 + j  # E onwards (after NOTES)
+            header_cell = xlsxwriter.utility.xl_rowcol_to_cell(0, col_idx, row_abs=True, col_abs=True)
 
-        ws_sup.autofilter(0, 0, len(supplier_rows), c)
-        ws_sup.freeze_panes(1, 0)
+            # SUMIFS over ADMIN Final Qty:
+            # Vendor Code in ADMIN column H
+            # Color SKU in ADMIN column AF
+            # Color in ADMIN column E
+            # Size in ADMIN column F
+            fml = (
+                f"=SUMIFS(ADMIN!$Q:$Q,"
+                f"ADMIN!$H:$H,$A{rr},"
+                f"ADMIN!$AF:$AF,$B{rr},"
+                f"ADMIN!$E:$E,$C{rr},"
+                f"ADMIN!$F:$F,{header_cell})"
+            )
+            ws_po.write_formula(i + 1, col_idx, fml)
 
-        # PO READY
-        po_sheet = "PO READY"
-        ws_po = workbook.add_worksheet(po_sheet)
-        writer.sheets[po_sheet] = ws_po
+        # TOTAL units
+        if len(sizes) > 0:
+            first_cell = xlsxwriter.utility.xl_rowcol_to_cell(i + 1, 4)
+            last_cell = xlsxwriter.utility.xl_rowcol_to_cell(i + 1, 4 + len(sizes) - 1)
+            ws_po.write_formula(i + 1, 4 + len(sizes), f"=SUM({first_cell}:{last_cell})")
+        else:
+            ws_po.write_number(i + 1, 4, 0)
 
-        po_base_cols = []
-        if "Supplier Code" in po_rows.columns:
-            po_base_cols.append("Supplier Code")
-        po_base_cols.append("Our Code")
-        if "Color" in po_rows.columns:
-            po_base_cols.append("Color")
-        po_base_cols.append("Notes")
+        # PHOTO last
+        ws_po.write_string(i + 1, 5 + len(sizes), str(po_base.loc[i, "Photo"]))
 
-        c = 0
-        for col in po_base_cols:
-            ws_po.write(0, c, col, fmt_header)
-            c += 1
-        for sz in size_headers:
-            ws_po.write(0, c, sz, fmt_header)
-            c += 1
-        ws_po.write(0, c, "Total Units", fmt_header)
-        c += 1
-        ws_po.write(0, c, "PHOTO", fmt_header)
+    ws_po.freeze_panes(1, 4)
+    ws_po.set_column(0, 2, 18)
+    ws_po.set_column(3, 3, 22)  # NOTES
+    ws_po.set_column(4, 4 + max(0, len(sizes) - 1), 6)
+    ws_po.set_column(4 + len(sizes), 4 + len(sizes), 12)  # TOTAL
+    ws_po.set_column(len(po_headers) - 1, len(po_headers) - 1, 55)  # PHOTO
 
-        po_col_idx_local = {po_base_cols[k]: k for k in range(len(po_base_cols))}
+    ws_po.add_table(
+        0, 0, len(po_base), len(po_headers) - 1,
+        {
+            "name": "tbl_po_ready",
+            "style": "Table Style Light 9",
+            "autofilter": True,
+            "columns": [{"header": h} for h in po_headers],
+        },
+    )
 
-        for i in range(len(po_rows)):
-            excel_r = i + 1
-            c = 0
-            for col in po_base_cols:
-                v = po_rows.iloc[i][col]
-                if col == "Notes":
-                    ws_po.write(excel_r, c, "" if pd.isna(v) else v, fmt_notes)
-                else:
-                    ws_po.write(excel_r, c, "" if pd.isna(v) else v, fmt_cell)
-                c += 1
+    # PO READY print setup (Excel -> Print / Save as PDF)
+    ws_po.set_landscape()
+    ws_po.set_paper(9)         # A4
+    ws_po.fit_to_pages(1, 0)   # fit all columns to 1 page wide
+    ws_po.repeat_rows(0)       # repeat header row on each page
+    ws_po.set_margins(0.2, 0.2, 0.3, 0.3)
 
-            supplier_cell = f"${excel_col(po_col_idx_local['Supplier Code'])}${excel_r+1}" if "Supplier Code" in po_col_idx_local else None
-            our_cell = f"${excel_col(po_col_idx_local['Our Code'])}${excel_r+1}"
-            color_cell = f"${excel_col(po_col_idx_local['Color'])}${excel_r+1}" if "Color" in po_col_idx_local else None
+    # INSTRUCTIONS
+    instr = (
+        "INSTRUCTIONS (simple):\n"
+        "1) Upload the 3 inputs and download the Excel.\n"
+        "2) SETTINGS: focus on essentials.\n"
+        "3) ADMIN: type Override Qty if needed (Final Qty updates).\n"
+        "4) SUPPLIER and PO READY update automatically based on ADMIN Final Qty.\n"
+        "Note: adding/removing SKUs/rows requires regenerating the Excel from the app."
+    )
+    ws_help.write(0, 0, instr, fmt_note)
+    ws_help.set_column(0, 0, 130)
 
-            first_size_col = c
-            for sz in size_headers:
-                sz_header_cell = f"{excel_col(c)}$1"
-                parts = [f"=SUMIFS({rng_final};{rng_size};{sz_header_cell};{rng_our};{our_cell}"]
-                if supplier_cell and rng_supplier:
-                    parts.append(f";{rng_supplier};{supplier_cell}")
-                if color_cell and rng_color:
-                    parts.append(f";{rng_color};{color_cell}")
-                parts.append(")")
-                ws_po.write_formula(excel_r, c, "".join(parts), fmt_int)
-                c += 1
-
-            total_formula = f"=SUM({excel_col(first_size_col)}{excel_r+1}:{excel_col(c-1)}{excel_r+1})"
-            ws_po.write_formula(excel_r, c, total_formula, fmt_int)
-            c += 1
-
-            photo_val = ""
-            if photo_col and photo_col in full_df.columns:
-                mask = (full_df["Our Code"] == po_rows.iloc[i]["Our Code"])
-                if "Supplier Code" in po_rows.columns and supplier_col and supplier_col in full_df.columns:
-                    mask = mask & (full_df[supplier_col] == po_rows.iloc[i]["Supplier Code"])
-                if "Color" in po_rows.columns and color_col and color_col in full_df.columns:
-                    mask = mask & (full_df[color_col] == po_rows.iloc[i]["Color"])
-                candidates = full_df.loc[mask, photo_col].dropna()
-                if len(candidates) > 0:
-                    photo_val = str(candidates.iloc[0])
-
-            if photo_val.startswith("http"):
-                ws_po.write_url(excel_r, c, photo_val, fmt_link, string=photo_val)
-            else:
-                ws_po.write(excel_r, c, photo_val, fmt_cell)
-
-        ws_po.autofilter(0, 0, len(po_rows), c)
-        ws_po.freeze_panes(1, 0)
-
-        # Print settings for PO READY (fit to page width, repeat header row)
-        ws_po.set_landscape()
-        ws_po.fit_to_pages(1, 0)  # 1 page wide, unlimited tall
-        ws_po.repeat_rows(0)      # repeat first row on each page
-        ws_po.set_margins(0.3, 0.3, 0.4, 0.4)
-
-    return output.getvalue()
+    wb.close()
+    output.seek(0)
+    return output.read()
 
 
-# -----------------------------
+# ----------------------------
 # Streamlit UI
-# -----------------------------
+# ----------------------------
 
-st.set_page_config(page_title="TFP Dynamic Restock", layout="wide")
-st.title("TFP Dynamic Restock – Export Builder")
+def main():
+    st.set_page_config(page_title="TFP Restock Engine", layout="wide")
 
-with st.sidebar:
-    st.header("Settings (Minimal)")
-    year_tag = st.text_input("year_tag (optional)", value="", help="Filters rows if a Season/Tag column contains this text (e.g., 2025).")
-    lead_time_weeks = st.number_input("lead_time_weeks", min_value=0.0, value=6.0, step=0.5)
-    target_weeks = st.number_input("target_weeks (coverage)", min_value=0.0, value=10.0, step=0.5)
-    safety_buffer = st.number_input("safety_buffer (0.15 = +15%)", min_value=0.0, max_value=2.0, value=0.15, step=0.05)
-    rounding_step = st.number_input("rounding_step", min_value=1, value=1, step=1)
-    moq = st.number_input("moq", min_value=0, value=0, step=1)
-    sales_window_weeks = st.number_input("sales_window_weeks", min_value=1.0, value=8.0, step=1.0)
+    st.title("TFP Restock Engine")
+    st.caption("Build an Excel 2021-safe restock model (FULL / SETTINGS / ADMIN / SUPPLIER / PO READY).")
 
-    st.divider()
-    st.caption("Auto column mapping. If something isn't detected, rename columns to common names (SKU/Variant SKU, Color, Photo, Forecasted, Incoming, Qty Delivered).")
+    colA, colB = st.columns([1.1, 0.9], gap="large")
 
-settings = Settings(
-    year_tag=year_tag,
-    lead_time_weeks=float(lead_time_weeks),
-    target_weeks=float(target_weeks),
-    safety_buffer=float(safety_buffer),
-    rounding_step=int(rounding_step),
-    moq=int(moq),
-    sales_window_weeks=float(sales_window_weeks),
-)
+    with colA:
+        st.subheader("1) Upload inputs")
+        odoo_file = st.file_uploader("Odoo Product Variant (product.product) .xlsx (warehouse truth set)", type=["xlsx"], key="odoo")
+        shop_file = st.file_uploader("Shopify Net sales export .csv", type=["csv"], key="shop")
+        pivot_file = st.file_uploader("Odoo Pivot Sales Analysis (sale.report) .xlsx", type=["xlsx"], key="pivot")
 
-st.subheader("1) Upload input")
-uploaded = st.file_uploader("Upload your base export (CSV or XLSX)", type=["csv", "xlsx", "xls"])
+        st.subheader("2) Output")
+        default_name = f"Restock_Model_{datetime.now().strftime('%Y-%m-%d_%H%M')}.xlsx"
+        out_name = st.text_input("Output filename", value=default_name)
 
-if not uploaded:
-    st.info("Upload a CSV/XLSX export to start.")
-    st.stop()
+        st.divider()
+        st.subheader("Settings (essentials)")
+        s1, s2 = st.columns(2)
 
-try:
-    base_df = read_table(uploaded)
-    base_df = normalize_input(base_df)
-    base_df, col_map = canonicalize_columns(base_df)
+        with s1:
+            sales_source = st.selectbox("sales_source", ["SHOPIFY", "ODOO", "MAX"], index=0)
+            season_mode = st.selectbox("season_mode", ["FW", "SS", "NEUTRAL"], index=0)
+            year_tag = st.text_input("year_tag", value="2025-2026")
 
-    with st.expander("Detected columns (auto-mapping)", expanded=False):
-        st.write(col_map)
+        with s2:
+            target_weeks = st.number_input("target_weeks", min_value=1, max_value=30, value=10, step=1)
+            lead_time_weeks = st.number_input("lead_time_weeks", min_value=0, max_value=20, value=3, step=1)
+            safety_buffer = st.number_input("safety_buffer", min_value=0.0, max_value=1.0, value=0.10, step=0.01, format="%.2f")
+            rounding_step = st.number_input("rounding_step", min_value=1, max_value=60, value=6, step=1)
+            moq = st.number_input("moq", min_value=0, max_value=60, value=6, step=1)
 
-    computed = compute_engine(base_df, col_map, settings)
+        with st.expander("Advanced (optional)", expanded=False):
+            a1, a2 = st.columns(2)
+            with a1:
+                mult_exact = st.number_input("mult_exact", min_value=0.0, max_value=5.0, value=1.20, step=0.05, format="%.2f")
+                mult_partial = st.number_input("mult_partial", min_value=0.0, max_value=5.0, value=1.00, step=0.05, format="%.2f")
+            with a2:
+                mult_offseason = st.number_input("mult_offseason", min_value=0.0, max_value=5.0, value=0.65, step=0.05, format="%.2f")
+                mult_unknown = st.number_input("mult_unknown", min_value=0.0, max_value=5.0, value=0.90, step=0.05, format="%.2f")
+            allow_override_outlet = st.selectbox("allow_override_outlet", [0, 1], index=0)
 
-    st.subheader("2) Preview (ADMIN view)")
-    preview_cols = [c for c in [
-        col_map.get("supplier_code"),
-        "Our Code",
-        col_map.get("product_type"),
-        col_map.get("product_name"),
-        col_map.get("color_name"),
-        col_map.get("variant_sku"),
-        "Size",
-        "Odoo Qty Delivered",
-        "Forecasted (Odoo)",
-        "Effective Forecasted",
-        "Units/week adj",
-        "Demand units (target)",
-        "Gap",
-        "Reorder point",
-        "Engine Suggested",
-    ] if c and c in computed.columns]
+        settings_overrides = dict(
+            sales_source=sales_source,
+            season_mode=season_mode,
+            year_tag=year_tag.strip(),
+            target_weeks=int(target_weeks),
+            lead_time_weeks=int(lead_time_weeks),
+            safety_buffer=float(safety_buffer),
+            rounding_step=int(rounding_step),
+            moq=int(moq),
+            mult_exact=float(mult_exact),
+            mult_partial=float(mult_partial),
+            mult_offseason=float(mult_offseason),
+            mult_unknown=float(mult_unknown),
+            allow_override_outlet=int(allow_override_outlet),
+        )
 
-    st.dataframe(computed[preview_cols].head(200), use_container_width=True, height=520)
+        build_btn = st.button("Build Excel model", type="primary", use_container_width=True)
 
-    st.subheader("3) Export")
-    excel_bytes = build_excel(computed, col_map, settings)
+    with colB:
+        st.subheader("Preview / Diagnostics")
+        st.write("Upload the 3 inputs and click **Build Excel model**. You will get a download button.")
 
-    st.download_button(
-        label="Download Excel (FULL + ADMIN + SUPPLIER + PO READY)",
-        data=excel_bytes,
-        file_name="tfp_dynamic_restock_export.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        if "last_error" in st.session_state and st.session_state["last_error"]:
+            st.error(st.session_state["last_error"])
 
-    st.markdown(
-        """
-**Ερώτηση: Αν αλλάξω ποσότητες στο ADMIN, ενημερώνονται SUPPLIER & PO READY;**
+        if "stats" in st.session_state and st.session_state["stats"]:
+            stats = st.session_state["stats"]
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Warehouse SKUs", stats.get("warehouse_skus", 0))
+            k2.metric("Shopify SKUs with sales", stats.get("shopify_skus_with_sales", 0))
+            k3.metric("Odoo SKUs delivered", stats.get("odoo_skus_with_delivered", 0))
+            k4.metric("SKUs with zero sales", stats.get("skus_with_zero_sales", 0))
 
-Ναι. Το **SUPPLIER** και το **PO READY** είναι χτισμένα με **SUMIFS formulas** πάνω στο **ADMIN → Final Qty**.
-Άρα όταν συμπληρώνεις **Override Qty** στο ADMIN, αλλάζει το Final Qty και ενημερώνονται αυτόματα τα άλλα tabs.
+        if "full_preview" in st.session_state and isinstance(st.session_state["full_preview"], pd.DataFrame):
+            st.write("Sample rows (FULL)")
+            st.dataframe(st.session_state["full_preview"], use_container_width=True, height=420)
 
-Προσοχή μόνο σε αυτό:
-- Αν **προσθέσεις/αφαιρέσεις γραμμές** χειροκίνητα στο Excel, τα SUMIFS ranges είναι “σταθερά” στις γραμμές που εξήγαγε το app.
-  Σε τέτοια περίπτωση είτε επεκτείνεις ranges, είτε ξανατρέχεις export.
-"""
-    )
+        if "excel_bytes" in st.session_state and st.session_state["excel_bytes"]:
+            st.success("Excel is ready.")
+            st.download_button(
+                label="Download Excel model",
+                data=st.session_state["excel_bytes"],
+                file_name=st.session_state.get("excel_name", "Restock_Model.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
-except Exception as e:
-    st.error(f"Error: {e}")
+    if build_btn:
+        st.session_state["last_error"] = ""
+        st.session_state["excel_bytes"] = None
+        st.session_state["stats"] = None
+        st.session_state["full_preview"] = None
+        st.session_state["excel_name"] = out_name.strip() or default_name
+
+        if not (odoo_file and shop_file and pivot_file):
+            st.session_state["last_error"] = "Please upload all 3 input files (Odoo Product Variant, Shopify CSV, Odoo Pivot)."
+            st.rerun()
+
+        try:
+            full, days_window, stats = build_full_df(
+                odoo_bytes=odoo_file.getvalue(),
+                shopify_bytes=shop_file.getvalue(),
+                shopify_filename=shop_file.name,
+                pivot_bytes=pivot_file.getvalue(),
+            )
+            st.session_state["stats"] = stats
+            st.session_state["full_preview"] = full.head(40)
+            excel_bytes = build_excel_bytes(full, days_window, settings_overrides)
+            st.session_state["excel_bytes"] = excel_bytes
+            st.rerun()
+        except Exception as e:
+            st.session_state["last_error"] = f"Build failed: {e}"
+            st.rerun()
+
+
+if __name__ == "__main__":
+    main()
