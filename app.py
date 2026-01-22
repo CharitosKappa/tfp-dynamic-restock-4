@@ -178,6 +178,13 @@ def pick_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
+def col_or_default(df: pd.DataFrame, col: str, default):
+    """Return a column as a Series; if missing, return a same-length Series filled with default."""
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
+
+
 def parse_size_sort_key(x: str):
     """Sort sizes: numeric first, then alpha."""
     s = str(x).strip()
@@ -312,17 +319,17 @@ def build_full_df(
         "Product Type": product_type,
         "Product Name": product_name,
         "Variant SKU": base["Variant SKU"].astype(str),
-        "Group Key": base.get("Color SKU", "").astype(str).fillna(""),
-        "Our Code": base.get("Master Code", "").astype(str).fillna(""),
-        "Color": base.get("Color Attribute", "").apply(clean_color_attr),
-        "Size": base.get("Size Value", "").astype(str).fillna(""),
-        "Vendor": base.get("Vendors/Display Name", "").astype(str).fillna(""),
-        "Vendor Code": base.get("Vendors/Vendor Product Code", "").astype(str).fillna(""),
-        "Product Season": base.get("Product Season", "").astype(str).fillna(""),
-        "On Hand": base.get("Quantity On Hand", 0).apply(to_float),
-        "Reserved / Outgoing": base.get("Outgoing Quantity", 0).apply(to_float) if "Outgoing Quantity" in base.columns else 0.0,
-        "Incoming": base.get("Incoming Quantity", 0).apply(to_float) if "Incoming Quantity" in base.columns else 0.0,
-        "Forecasted (Odoo)": base.get("Forecasted Quantity", "").apply(to_float, default=np.nan),
+        "Group Key": col_or_default(base, "Color SKU", "").astype(str).fillna(""),
+        "Our Code": col_or_default(base, "Master Code", "").astype(str).fillna(""),
+        "Color": col_or_default(base, "Color Attribute", "").apply(clean_color_attr),
+        "Size": col_or_default(base, "Size Value", "").astype(str).fillna(""),
+        "Vendor": col_or_default(base, "Vendors/Display Name", "").astype(str).fillna(""),
+        "Vendor Code": col_or_default(base, "Vendors/Vendor Product Code", "").astype(str).fillna(""),
+        "Product Season": col_or_default(base, "Product Season", "").astype(str).fillna(""),
+        "On Hand": col_or_default(base, "Quantity On Hand", 0).apply(to_float),
+        "Reserved / Outgoing": col_or_default(base, "Outgoing Quantity", 0).apply(to_float),
+        "Incoming": col_or_default(base, "Incoming Quantity", 0).apply(to_float),
+        "Forecasted (Odoo)": col_or_default(base, "Forecasted Quantity", np.nan).apply(lambda v: to_float(v, default=np.nan)),
         "Photo": base[col_photo].astype(str).fillna("") if col_photo else "",
     })
 
